@@ -1,0 +1,90 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+@layer base {
+  :root {
+    --font-display: 'Space Grotesk', system-ui, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+    --lrt2-purple: #6b21a8;
+    --lrt2-purple-deep: #4c1d95;
+    --lrt2-purple-tint: #f3e8ff;
+    --surface-canvas: #f4f6f8;
+    --surface-card: #ffffff;
+    --ink-primary: #0f172a;
+    --ink-secondary: #475569;
+  }
+
+  html {
+    color-scheme: light;
+    caret-color: var(--lrt2-purple);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--surface-canvas);
+    color: var(--ink-primary);
+    margin: 0;
+  }
+
+  ::selection {
+    background-color: var(--lrt2-purple-tint);
+    color: var(--lrt2-purple-deep);
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  a {
+    text-underline-offset: 3px;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--lrt2-purple);
+    outline-offset: 2px;
+  }
+
+  .font-mono-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes wave-shift {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes sonar-drop {
+  0% {
+    opacity: 0.9;
+    transform: translateY(0) scaleX(0.75);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(100%) scaleX(1.35);
+  }
+}
+
+.animate-wave-slow {
+  animation: wave-shift 6s linear infinite;
+}
+
+.animate-wave-fast {
+  animation: wave-shift 3.4s linear infinite reverse;
+}
+
+.leaflet-container {
+  font-family: var(--font-sans);
+  z-index: 1;
+}

@@ -4,3 +4,9 @@ include/config.h
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch/
+webapp/node_modules/
+webapp/dist/
+webapp/.env
+webapp/.vercel/
+.agent/
+enclosure/*.blend1
