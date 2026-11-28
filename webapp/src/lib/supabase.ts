@@ -11,7 +11,7 @@ export const supabase: SupabaseClient | null = isSupabaseConfigured
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
 
-const PREVIEW_SESSION_KEY = 'agos_lrt2_preview_session';
+const PREVIEW_SESSION_KEY = 'lrt2_flood_preview_session';
 
 export async function getActiveOperator(): Promise<OperatorUser | null> {
   if (supabase) {
@@ -73,10 +73,22 @@ export async function signInOperator(
       password,
     });
     if (error || !data.user) {
-      return {
-        user: null,
-        error: error?.message ?? 'Invalid Supabase credentials.',
-      };
+      const msg = error?.message ?? 'Invalid credentials.';
+      if (msg.toLowerCase().includes('email not confirmed')) {
+        return {
+          user: null,
+          error:
+            'Email not confirmed yet. Check your inbox or disable "Confirm email" in Supabase → Authentication → Providers → Email.',
+        };
+      }
+      if (msg.toLowerCase().includes('invalid login credentials')) {
+        return {
+          user: null,
+          error:
+            'Invalid email/username or password. If you have not registered yet, click "Create Account" below first.',
+        };
+      }
+      return { user: null, error: msg };
     }
 
     const usernameMeta =
@@ -207,6 +219,34 @@ export async function fetchRecentReadings(
     .limit(limit);
   if (error || !data) return [];
   return (data as LiveReadingRow[]).reverse();
+}
+
+export async function fetchLatestAnyStation(): Promise<LiveReadingRow | null> {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from('flood_readings')
+    .select('id, station_id, raw_distance_cm, water_depth_cm, alert_level, source, recorded_at')
+    .order('recorded_at', { ascending: false })
+    .limit(1);
+  if (error || !data || data.length === 0) return null;
+  return data[0] as LiveReadingRow;
+}
+
+export async function saveOperatorSnapshot(
+  stationId: string,
+  rawDistanceCm: number,
+  waterDepthCm: number,
+  alertLevel: 'GREEN' | 'ORANGE' | 'RED',
+): Promise<boolean> {
+  if (!supabase) return false;
+  const { error } = await supabase.from('flood_readings').insert({
+    station_id: stationId,
+    raw_distance_cm: Number(rawDistanceCm.toFixed(1)),
+    water_depth_cm: Number(waterDepthCm.toFixed(1)),
+    alert_level: alertLevel,
+    source: 'ESP32',
+  });
+  return !error;
 }
 
 export function subscribeToStationReadings(

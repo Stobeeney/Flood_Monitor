@@ -5,7 +5,6 @@ import {
   Menu,
   Radio,
   Search,
-  SlidersHorizontal,
 } from 'lucide-react';
 import { BottomAnalytics } from './components/BottomAnalytics';
 import { PhilippinesFloodMap } from './components/PhilippinesFloodMap';
@@ -15,53 +14,32 @@ import { WaterSimulationPanel } from './components/WaterSimulationPanel';
 import { LRT2_STATIONS } from './data/lrt2Stations';
 import { fetchManilaFloodWeather } from './lib/phFloodApi';
 import {
+  fetchLatestAnyStation,
   fetchRecentReadings,
   getActiveOperator,
   isSupabaseConfigured,
+  saveOperatorSnapshot,
   signOutOperator,
   subscribeToStationReadings,
   supabase,
+  type LiveReadingRow,
 } from './lib/supabase';
 import { LoginPage } from './pages/LoginPage';
 import type {
-  AlertEvent,
   AlertLevel,
   Lrt2Station,
   NavSection,
   OperatorUser,
   PhWeatherData,
-  SimulationPreset,
   TelemetrySample,
   ThresholdConfig,
 } from './types/flood';
 
 function classifyLevel(rawDistanceCm: number, cfg: ThresholdConfig): AlertLevel {
-  if (rawDistanceCm <= cfg.alertDistanceCm) return 'RED';
-  if (rawDistanceCm <= cfg.warningDistanceCm) return 'ORANGE';
+  const waterDepthCm = Math.max(0, cfg.mountHeightCm - rawDistanceCm);
+  if (waterDepthCm >= cfg.alertDistanceCm) return 'RED';
+  if (waterDepthCm >= cfg.warningDistanceCm) return 'ORANGE';
   return 'GREEN';
-}
-
-function buildInitialSamples(
-  station: Lrt2Station,
-  cfg: ThresholdConfig,
-): TelemetrySample[] {
-  const now = Date.now();
-  return Array.from({ length: 24 }, (_, idx) => {
-    const t = new Date(now - (23 - idx) * 1000);
-    const wave = Math.sin(idx * 0.45) * 4.2;
-    const rawDistanceCm = Number((station.baselineDistanceCm + wave).toFixed(1));
-    const waterDepthCm = Number(
-      Math.max(0, cfg.mountHeightCm - rawDistanceCm).toFixed(1),
-    );
-    return {
-      timestamp: t.toLocaleTimeString('en-PH', { hour12: false }),
-      timeShort: t.toLocaleTimeString('en-PH', { hour12: false }),
-      rawDistanceCm,
-      waterDepthCm,
-      level: classifyLevel(rawDistanceCm, cfg),
-      stationId: station.id,
-    };
-  });
 }
 
 export function App() {
@@ -70,38 +48,27 @@ export function App() {
   const [activeSection, setActiveSection] = useState<NavSection>('dashboard');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
+  // Default to Marikina-Pasig (auto-switches if ESP32 streams under another LRT-2 station)
   const [selectedStation, setSelectedStation] = useState<Lrt2Station>(
-    LRT2_STATIONS[10], // Santolan (Marikina River) default focus
+    LRT2_STATIONS[11],
   );
   const [stationQuery, setStationQuery] = useState('');
 
   const [thresholds, setThresholds] = useState<ThresholdConfig>({
-    mountHeightCm: 180,
-    warningDistanceCm: 50,
-    alertDistanceCm: 25,
+    mountHeightCm: 45,
+    warningDistanceCm: 15,
+    alertDistanceCm: 30,
   });
 
-  const [dataMode, setDataMode] = useState<'simulator' | 'live_esp32'>(
-    isSupabaseConfigured ? 'live_esp32' : 'simulator',
-  );
-  const [lastLiveSync, setLastLiveSync] = useState<string | null>(null);
-  const [preset, setPreset] = useState<SimulationPreset>('rise_fall_cycle');
-  const [isPlaying, setIsPlaying] = useState(true);
   const [rawDistanceCm, setRawDistanceCm] = useState<number>(
-    LRT2_STATIONS[10].baselineDistanceCm,
+    LRT2_STATIONS[11].baselineDistanceCm,
   );
-  const [samples, setSamples] = useState<TelemetrySample[]>(() =>
-    buildInitialSamples(LRT2_STATIONS[10], {
-      mountHeightCm: 180,
-      warningDistanceCm: 50,
-      alertDistanceCm: 25,
-    }),
-  );
-  const [alertEvents, setAlertEvents] = useState<AlertEvent[]>([]);
+  const [samples, setSamples] = useState<TelemetrySample[]>([]);
+  const [savedLogs, setSavedLogs] = useState<LiveReadingRow[]>([]);
   const [weatherData, setWeatherData] = useState<PhWeatherData | null>(null);
-  const [tickPhase, setTickPhase] = useState(0);
+  const [lastLiveSync, setLastLiveSync] = useState<string | null>(null);
 
-  // Check Supabase / preview auth on mount
+  // Check Supabase auth session on mount
   useEffect(() => {
     let mounted = true;
     getActiveOperator().then((user) => {
@@ -140,6 +107,22 @@ export function App() {
     };
   }, []);
 
+  // Auto-detect whichever LRT-2 station the ESP32 is actively streaming to on first load
+  useEffect(() => {
+    if (!operator || !isSupabaseConfigured) return;
+    let cancelled = false;
+    fetchLatestAnyStation().then((latest) => {
+      if (cancelled || !latest) return;
+      const matched = LRT2_STATIONS.find((s) => s.id === latest.station_id);
+      if (matched) {
+        setSelectedStation(matched);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [operator]);
+
   // Fetch Manila weather & RainViewer radar for selected station
   useEffect(() => {
     if (!operator) return;
@@ -162,33 +145,68 @@ export function App() {
     };
   }, [operator, selectedStation]);
 
-  // Live ESP32 telemetry stream from Supabase (for Vercel deployment)
+  // Real-time ESP32 telemetry stream from Supabase (Realtime + 2s polling)
   useEffect(() => {
-    if (!operator || dataMode !== 'live_esp32' || !isSupabaseConfigured) return;
+    if (!operator || !isSupabaseConfigured) return;
 
     let cancelled = false;
 
+    const applyIncomingRow = (
+      rawCm: number,
+      recordedAt: string,
+      stationId: string,
+    ) => {
+      const depthCm = Number(
+        Math.max(0, thresholds.mountHeightCm - rawCm).toFixed(1),
+      );
+      const lvl = classifyLevel(rawCm, thresholds);
+      const ts = new Date(recordedAt).toLocaleTimeString('en-PH', {
+        hour12: false,
+      });
+
+      setRawDistanceCm(rawCm);
+      setLastLiveSync(ts);
+
+      setSamples((prev) => [
+        ...prev.slice(-59),
+        {
+          timestamp: ts,
+          timeShort: ts,
+          rawDistanceCm: rawCm,
+          waterDepthCm: depthCm,
+          level: lvl,
+          stationId,
+        },
+      ]);
+    };
+
     const loadLatest = async () => {
-      const rows = await fetchRecentReadings(selectedStation.id, 45);
+      const rows = await fetchRecentReadings(selectedStation.id, 150);
       if (cancelled || rows.length === 0) return;
       const latest = rows[rows.length - 1];
-      setRawDistanceCm(Number(latest.raw_distance_cm));
+      const latestRaw = Number(latest.raw_distance_cm);
+      setRawDistanceCm(latestRaw);
       setLastLiveSync(
         new Date(latest.recorded_at).toLocaleTimeString('en-PH', {
           hour12: false,
         }),
       );
+      setSavedLogs([...rows].reverse());
       setSamples(
-        rows.map((r) => {
+        rows.slice(-60).map((r) => {
           const ts = new Date(r.recorded_at).toLocaleTimeString('en-PH', {
             hour12: false,
           });
+          const rawVal = Number(r.raw_distance_cm);
+          const depthVal = Number(
+            Math.max(0, thresholds.mountHeightCm - rawVal).toFixed(1),
+          );
           return {
             timestamp: ts,
             timeShort: ts,
-            rawDistanceCm: Number(r.raw_distance_cm),
-            waterDepthCm: Number(r.water_depth_cm),
-            level: r.alert_level,
+            rawDistanceCm: rawVal,
+            waterDepthCm: depthVal,
+            level: classifyLevel(rawVal, thresholds),
             stationId: r.station_id,
           };
         }),
@@ -198,143 +216,45 @@ export function App() {
     loadLatest();
     const unsubscribe = subscribeToStationReadings(selectedStation.id, (row) => {
       if (cancelled) return;
-      setRawDistanceCm(Number(row.raw_distance_cm));
-      setLastLiveSync(
-        new Date(row.recorded_at).toLocaleTimeString('en-PH', {
-          hour12: false,
-        }),
+      setSavedLogs((prev) => [row, ...prev.filter((r) => r.id !== row.id)].slice(0, 150));
+      applyIncomingRow(
+        Number(row.raw_distance_cm),
+        row.recorded_at,
+        row.station_id,
       );
     });
-    const poll = setInterval(loadLatest, 5000);
+    const poll = setInterval(loadLatest, 1200);
 
     return () => {
       cancelled = true;
       unsubscribe();
       clearInterval(poll);
     };
-  }, [operator, dataMode, selectedStation.id]);
-
-  // Simulation 1 Hz engine (runs only in Simulator mode)
-  useEffect(() => {
-    if (!operator || !isPlaying || dataMode !== 'simulator') return;
-
-    const timer = setInterval(() => {
-      setTickPhase((p) => p + 1);
-      setRawDistanceCm((prev) => {
-        let next = prev;
-        if (preset === 'rise_fall_cycle') {
-          // Smooth continuous rise-and-fall sweep across Green, Orange, and Red zones
-          const minGap = Math.max(12, thresholds.alertDistanceCm - 8);
-          const maxGap = Math.min(thresholds.mountHeightCm - 25, 138);
-          const mid = (minGap + maxGap) / 2;
-          const amp = (maxGap - minGap) / 2;
-          next = mid + Math.cos(tickPhase * 0.22) * amp;
-        } else if (preset === 'normal_cycle') {
-          const center = selectedStation.baselineDistanceCm;
-          next = center + Math.sin(tickPhase * 0.35) * 10;
-        } else if (preset === 'rising_storm') {
-          next = Math.max(14, prev - 3.2 + (Math.random() - 0.5) * 0.8);
-        } else if (preset === 'critical_flood') {
-          next = 18 + Math.sin(tickPhase * 0.6) * 4.5;
-        } else if (preset === 'receding') {
-          next = Math.min(
-            selectedStation.baselineDistanceCm,
-            prev + 3.0 + (Math.random() - 0.5) * 0.6,
-          );
-        } else {
-          // Manual mode adds subtle realistic water-surface ripple
-          next = Math.max(
-            5,
-            Math.min(thresholds.mountHeightCm - 5, prev + (Math.random() - 0.5) * 0.4),
-          );
-        }
-        return Number(
-          Math.max(5, Math.min(thresholds.mountHeightCm - 5, next)).toFixed(1),
-        );
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [
-    operator,
-    isPlaying,
-    dataMode,
-    preset,
-    selectedStation.baselineDistanceCm,
-    thresholds.alertDistanceCm,
-    thresholds.mountHeightCm,
-    tickPhase,
-  ]);
+  }, [operator, selectedStation, thresholds]);
 
   const waterDepthCm = Number(
     Math.max(0, thresholds.mountHeightCm - rawDistanceCm).toFixed(1),
   );
   const alertLevel = classifyLevel(rawDistanceCm, thresholds);
 
-  // Record sample history & alert state transitions
-  useEffect(() => {
-    if (!operator) return;
-    const nowStr = new Date().toLocaleTimeString('en-PH', { hour12: false });
-    const sample: TelemetrySample = {
-      timestamp: nowStr,
-      timeShort: nowStr,
+  const handleSelectStation = useCallback((station: Lrt2Station) => {
+    setSelectedStation(station);
+    setSamples([]);
+    setSavedLogs([]);
+    setLastLiveSync(null);
+  }, []);
+
+  async function handleSaveSnapshot() {
+    await saveOperatorSnapshot(
+      selectedStation.id,
       rawDistanceCm,
       waterDepthCm,
-      level: alertLevel,
-      stationId: selectedStation.id,
-    };
-
-    setSamples((prev) => {
-      const last = prev[prev.length - 1];
-      if (last && last.level !== alertLevel) {
-        const msg =
-          alertLevel === 'RED'
-            ? 'Critical flood threshold breached (RED)'
-            : alertLevel === 'ORANGE'
-              ? 'Pre-flood warning threshold reached (ORANGE)'
-              : 'Water surface returned to safe clearance (GREEN)';
-        setAlertEvents((events) => [
-          {
-            id: `${Date.now()}-${Math.random()}`,
-            timestamp: nowStr,
-            stationName: selectedStation.name,
-            level: alertLevel,
-            rawDistanceCm,
-            waterDepthCm,
-            message: msg,
-          },
-          ...events.slice(0, 49),
-        ]);
-      }
-      return [...prev.slice(-59), sample];
-    });
-  }, [operator, rawDistanceCm, waterDepthCm, alertLevel, selectedStation]);
-
-  const handleSelectStation = useCallback(
-    (station: Lrt2Station) => {
-      setSelectedStation(station);
-      if (preset === 'normal_cycle') {
-        setRawDistanceCm(station.baselineDistanceCm);
-      }
-    },
-    [preset],
-  );
-
-  function handlePresetChange(nextPreset: SimulationPreset) {
-    setPreset(nextPreset);
-    setIsPlaying(true);
-    if (nextPreset === 'critical_flood') {
-      setRawDistanceCm(18);
-    } else if (nextPreset === 'rising_storm') {
-      setRawDistanceCm(Math.max(thresholds.warningDistanceCm + 8, 62));
-    } else if (nextPreset === 'normal_cycle') {
-      setRawDistanceCm(selectedStation.baselineDistanceCm);
+      alertLevel,
+    );
+    const rows = await fetchRecentReadings(selectedStation.id, 150);
+    if (rows.length > 0) {
+      setSavedLogs([...rows].reverse());
     }
-  }
-
-  function handleManualDistance(val: number) {
-    setPreset('manual');
-    setRawDistanceCm(val);
   }
 
   async function handleLogout() {
@@ -349,17 +269,9 @@ export function App() {
       if (st.id === selectedStation.id) {
         map[st.id] = { level: alertLevel, rawCm: rawDistanceCm };
       } else {
-        // Adjacent high-risk stations reflect basin pressure slightly when surge occurs
-        const surgeOffset =
-          alertLevel === 'RED' && st.riskProfile === 'High'
-            ? -70
-            : alertLevel === 'ORANGE' && st.riskProfile === 'High'
-              ? -55
-              : 0;
-        const estRaw = Math.max(12, st.baselineDistanceCm + surgeOffset);
         map[st.id] = {
-          level: classifyLevel(estRaw, thresholds),
-          rawCm: estRaw,
+          level: classifyLevel(st.baselineDistanceCm, thresholds),
+          rawCm: st.baselineDistanceCm,
         };
       }
     });
@@ -484,34 +396,18 @@ export function App() {
                 {selectedStation.municipality} · {selectedStation.waterway}
               </p>
             </div>
-            <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-white border border-[#E2E8F0] text-xs font-semibold">
-              <button
-                type="button"
-                onClick={() => setDataMode('simulator')}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
-                  dataMode === 'simulator'
-                    ? 'bg-[#6B21A8] text-white'
-                    : 'text-[#475569] hover:text-[#0F172A]'
-                }`}
-              >
-                <SlidersHorizontal className="w-3.5 h-3.5" />
-                Simulator
-              </button>
-              <button
-                type="button"
-                onClick={() => setDataMode('live_esp32')}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
-                  dataMode === 'live_esp32'
-                    ? 'bg-[#16A34A] text-white'
-                    : 'text-[#475569] hover:text-[#0F172A]'
-                }`}
-              >
-                <Radio className="w-3.5 h-3.5" />
-                {dataMode === 'live_esp32' && lastLiveSync
-                  ? `Live ESP32 (${lastLiveSync})`
-                  : 'Live ESP32'}
-              </button>
-            </div>
+            <span
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold ${
+                lastLiveSync
+                  ? 'bg-[#DCFCE7] border-[#86EFAC] text-[#15803D]'
+                  : 'bg-white border-[#E2E8F0] text-[#475569]'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              {lastLiveSync
+                ? `Live ESP32 · Last reading ${lastLiveSync}`
+                : 'Waiting for live ESP32 readings...'}
+            </span>
           </div>
 
           {/* Top 5 KPI Cards (Raw Data in cm + Green/Orange/Red Warning) */}
@@ -522,7 +418,9 @@ export function App() {
             thresholds={thresholds}
             samples={samples}
             selectedStation={selectedStation}
-            alertCountToday={alertEvents.length}
+            alertCountToday={
+              savedLogs.filter((r) => r.alert_level !== 'GREEN').length
+            }
             peakDepthCm={peakDepthCm}
           />
 
@@ -555,18 +453,18 @@ export function App() {
                 </label>
 
                 <label className="text-xs font-medium text-[#C2410C]">
-                  Orange Warning ≤ (cm)
+                  Orange Warning ≥ (cm)
                   <input
                     type="number"
-                    min={15}
-                    max={thresholds.mountHeightCm - 10}
+                    min={5}
+                    max={thresholds.alertDistanceCm - 5}
                     value={thresholds.warningDistanceCm}
                     onChange={(e) =>
                       setThresholds((t) => ({
                         ...t,
-                        warningDistanceCm: Math.max(
-                          t.alertDistanceCm + 5,
-                          Number(e.target.value) || 50,
+                        warningDistanceCm: Math.min(
+                          t.alertDistanceCm - 5,
+                          Math.max(5, Number(e.target.value) || 15),
                         ),
                       }))
                     }
@@ -575,18 +473,18 @@ export function App() {
                 </label>
 
                 <label className="text-xs font-medium text-[#B91C1C]">
-                  Red Critical ≤ (cm)
+                  Red Critical ≥ (cm)
                   <input
                     type="number"
-                    min={5}
-                    max={thresholds.warningDistanceCm - 5}
+                    min={thresholds.warningDistanceCm + 5}
+                    max={thresholds.mountHeightCm}
                     value={thresholds.alertDistanceCm}
                     onChange={(e) =>
                       setThresholds((t) => ({
                         ...t,
-                        alertDistanceCm: Math.min(
-                          t.warningDistanceCm - 5,
-                          Math.max(5, Number(e.target.value) || 25),
+                        alertDistanceCm: Math.max(
+                          t.warningDistanceCm + 5,
+                          Number(e.target.value) || 30,
                         ),
                       }))
                     }
@@ -597,7 +495,7 @@ export function App() {
             </section>
           ) : (
             <>
-              {/* Middle Row: Manila LRT-2 Flood Map (Left) + Water Level Simulation (Right) */}
+              {/* Middle Row: Manila LRT-2 Flood Map (Left) + Real-Time Water Staff Gauge (Right) */}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
                 {(activeSection === 'dashboard' || activeSection === 'map') && (
                   <div
@@ -629,11 +527,8 @@ export function App() {
                       alertLevel={alertLevel}
                       thresholds={thresholds}
                       selectedStation={selectedStation}
-                      preset={preset}
-                      isPlaying={isPlaying}
-                      onTogglePlay={() => setIsPlaying((p) => !p)}
-                      onSelectPreset={handlePresetChange}
-                      onManualDistanceChange={handleManualDistance}
+                      lastUpdated={lastLiveSync}
+                      isLiveConnected={Boolean(lastLiveSync)}
                     />
                   </div>
                 )}
@@ -643,10 +538,11 @@ export function App() {
               {(activeSection === 'dashboard' || activeSection === 'alerts') && (
                 <BottomAnalytics
                   samples={samples}
-                  alertEvents={alertEvents}
+                  savedLogs={savedLogs}
                   weatherData={weatherData}
                   selectedStation={selectedStation}
                   thresholds={thresholds}
+                  onSaveSnapshot={handleSaveSnapshot}
                 />
               )}
             </>

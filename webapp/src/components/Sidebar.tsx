@@ -26,7 +26,7 @@ const OPERATIONS_NAV: Array<{
 }> = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'map', label: 'LRT-2 Flood Map', icon: MapIcon },
-  { id: 'simulator', label: 'Water Simulation', icon: SlidersHorizontal },
+  { id: 'simulator', label: 'Water Gauge', icon: SlidersHorizontal },
   { id: 'alerts', label: 'Alert Monitor', icon: BellRing },
 ];
 
@@ -54,7 +54,7 @@ export function Sidebar({
             <span className="w-8 h-8 rounded-lg bg-white text-[#6B21A8] flex items-center justify-center">
               <Waves className="w-4 h-4" strokeWidth={2.2} />
             </span>
-            <span>AGOS-LRT2</span>
+            <span>LRT-2 Monitor</span>
           </div>
           <button
             type="button"

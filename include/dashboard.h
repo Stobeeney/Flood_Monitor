@@ -32,7 +32,11 @@ button.sec{background:#e2e8f0;color:#0f172a}button:disabled{opacity:.6;cursor:wa
 
 <section class="card">
   <h2>Live Telemetry</h2>
-  <div class="big"><span id="dist">—</span> <span style="font-size:18px;color:#64748b">cm</span></div>
+  <div class="big"><span id="dist">—</span> <span style="font-size:18px;color:#64748b">cm</span> <span id="rawDist" style="font-size:13px;color:#64748b;font-weight:500"></span></div>
+  <div class="row" style="margin-top:8px">
+    <button type="button" class="sec" onclick="calibrateBase()">Set Current Distance as 0 cm Baseline</button>
+    <span class="msg" id="baseMsg" style="margin:0"></span>
+  </div>
   <div class="grid">
     <div class="kv"><span>Wi-Fi STA</span><strong id="wifiSta">Disconnected</strong></div>
     <div class="kv"><span>NTP Time Sync</span><strong id="ntpState">Waiting</strong></div>
@@ -90,24 +94,63 @@ button.sec{background:#e2e8f0;color:#0f172a}button:disabled{opacity:.6;cursor:wa
     <div class="msg" id="cloudMsg"></div>
   </form>
 </section>
+
+<section class="card">
+  <h2>3. SMS Alert Recipient (Air780E · Smart SIM)</h2>
+  <form onsubmit="saveSms(event)">
+    <label for="smsPhone">Recipient Mobile Number (09XXXXXXXXX or +639XXXXXXXXX)</label>
+    <input id="smsPhone" required placeholder="09171234567">
+    <div class="row">
+      <button type="submit">Save SMS Number</button>
+      <button type="button" class="sec" id="smsTestBtn" onclick="testSms()">Send Test SMS</button>
+    </div>
+    <div class="msg" id="smsMsg"></div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>4. Manual Date &amp; Time (DS1302 RTC &amp; LCD)</h2>
+  <form onsubmit="setManualTime(event)">
+    <label for="manualTime">Set Date &amp; Time (updates DS1302 RTC &amp; 16x2 LCD immediately)</label>
+    <input id="manualTime" type="datetime-local" step="1" required>
+    <div class="row">
+      <button type="submit">Set Manual Time</button>
+      <button type="button" class="sec" onclick="useDeviceTime()">Use Phone/PC Time</button>
+    </div>
+    <div class="msg" id="timeMsg"></div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>5. ESP32 Local Flash Logs (LittleFS Backup)</h2>
+  <div style="font-size:13px;color:#475569">Stored size: <strong id="logSize">0.0 KB</strong> (auto-logs every 10s + on alerts)</div>
+  <div class="row">
+    <a href="/logs.csv" download="esp32_flood_logs.csv"><button type="button">Download logs.csv</button></a>
+    <button type="button" class="sec" onclick="clearLogs()">Clear Flash Logs</button>
+  </div>
+  <div class="msg" id="logMsg"></div>
+</section>
 </main><script>
 const $=id=>document.getElementById(id);let loadedCfg=false;
 async function poll(){
   try{
     const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();
-    $('dist').textContent=d.distance_cm===null?'—':d.distance_cm.toFixed(1);
+    $('dist').textContent=d.water_depth_cm===null||d.water_depth_cm===undefined?'—':d.water_depth_cm.toFixed(1);
+    $('rawDist').textContent=d.distance_cm===null?'':('(Sensor dist: '+d.distance_cm.toFixed(1)+' cm)');
     $('rtc').textContent='RTC: '+(d.rtc_time||'—')+' (Asia/Manila)';
     const b=$('alertBadge');b.textContent=d.status||'ONLINE';
     b.className='badge '+(d.status==='FLOOD_ALERT'?'err':d.status==='WARNING'?'warn':'ok');
-    $('wifiSta').textContent=d.wifi_connected?(d.wifi_ssid+' ('+d.sta_ip+')'):(d.wifi_ssid?('Connecting '+d.wifi_ssid+'…'):'Not configured');
+    $('wifiSta').textContent=d.wifi_connected?('Connected WiFi ('+d.wifi_ssid+' · '+d.sta_ip+')'):(d.wifi_failed?('Could not connect WiFi ('+d.wifi_ssid+')'):(d.wifi_ssid?('Connecting WiFi '+d.wifi_ssid+'…'):'Not configured'));
     $('ntpState').textContent=d.ntp_synced?'Synced (UTC+8)':'Waiting Wi-Fi';
-    $('cloudState').textContent=d.cloud_configured?(d.cloud_last_code>0?('HTTP '+d.cloud_last_code+' ('+d.station_id+')'):'Ready ('+d.station_id+')'):'Not configured';
+    $('cloudState').textContent=d.cloud_connected?('Connected to the cloud ('+d.station_id+')'):(d.cloud_configured?(d.cloud_last_code!==0?('Could not connect cloud (HTTP '+d.cloud_last_code+')'):'Connecting to cloud…'):'Not configured');
     $('gsmState').textContent=d.gsm_ready?'Ready':'Standby';
+    if(typeof d.log_bytes==='number')$('logSize').textContent=(d.log_bytes/1024).toFixed(1)+' KB';
     if(!loadedCfg){
       loadedCfg=true;
       if(d.wifi_ssid)$('ssid').value=d.wifi_ssid;
       if(d.sb_url)$('sbUrl').value=d.sb_url;
       if(d.station_id)$('stationId').value=d.station_id;
+      if(d.sms_phone && !d.sms_phone.includes('X'))$('smsPhone').value=d.sms_phone;
       if(d.mount_cm)$('mountCm').value=d.mount_cm;
     }
   }catch(e){$('alertBadge').textContent='Offline';$('alertBadge').className='badge err';}
@@ -148,5 +191,59 @@ async function saveCloud(e){
     const r=await fetch('/api/cloud/save',{method:'POST',body});$('cloudMsg').textContent=await r.text();
   }catch(err){$('cloudMsg').textContent='Save failed';}
 }
+async function clearLogs(){
+  $('logMsg').textContent='Clearing logs…';
+  const body=new URLSearchParams({confirm:'1'});
+  for(let i=0;i<2;i++){
+    try{
+      const r=await fetch('/api/logs/clear',{method:'POST',body});
+      $('logMsg').textContent=await r.text();
+      if(r.ok)$('logSize').textContent='0.1 KB';
+      return;
+    }catch(e){if(i===1)$('logMsg').textContent='Clear failed (check ESP32 Wi-Fi connection)';}
+  }
+}
+async function saveSms(e){
+  e.preventDefault();$('smsMsg').textContent='Saving number…';
+  try{
+    const body=new URLSearchParams({phone:$('smsPhone').value.trim()});
+    const r=await fetch('/api/sms/save',{method:'POST',body});$('smsMsg').textContent=await r.text();
+  }catch(err){$('smsMsg').textContent='Save failed';}
+}
+async function testSms(){
+  $('smsTestBtn').disabled=true;$('smsMsg').textContent='Sending test SMS via Smart SIM…';
+  try{const r=await fetch('/api/sms/test',{method:'POST'});$('smsMsg').textContent=await r.text();}
+  catch(e){$('smsMsg').textContent='Test SMS request failed';}
+  $('smsTestBtn').disabled=false;
+}
+function fmtLocalDt(dt){
+  const p=n=>String(n).padStart(2,'0');
+  return dt.getFullYear()+'-'+p(dt.getMonth()+1)+'-'+p(dt.getDate())+'T'+p(dt.getHours())+':'+p(dt.getMinutes())+':'+p(dt.getSeconds());
+}
+async function setManualTime(e){
+  e.preventDefault();$('timeMsg').textContent='Updating RTC & LCD…';
+  try{
+    const body=new URLSearchParams({datetime:$('manualTime').value});
+    const r=await fetch('/api/time/set',{method:'POST',body});$('timeMsg').textContent=await r.text();
+  }catch(err){$('timeMsg').textContent='Update failed';}
+}
+async function useDeviceTime(){
+  const val=fmtLocalDt(new Date());
+  $('manualTime').value=val;
+  $('timeMsg').textContent='Syncing phone/PC time to RTC & LCD…';
+  try{
+    const body=new URLSearchParams({datetime:val});
+    const r=await fetch('/api/time/set',{method:'POST',body});$('timeMsg').textContent=await r.text();
+  }catch(err){$('timeMsg').textContent='Sync failed';}
+}
+async function calibrateBase(){
+  $('baseMsg').textContent='Calibrating…';
+  try{
+    const body=new URLSearchParams({confirm:'1'});
+    const r=await fetch('/api/baseline/calibrate',{method:'POST',body});
+    $('baseMsg').textContent=await r.text();
+  }catch(e){$('baseMsg').textContent='Calibrate failed';}
+}
+$('manualTime').value=fmtLocalDt(new Date());
 poll();
 </script></body></html>)HTML";

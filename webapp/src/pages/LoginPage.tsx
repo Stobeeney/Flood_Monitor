@@ -5,8 +5,6 @@ import {
   Eye,
   EyeOff,
   Lock,
-  Radio,
-  ShieldCheck,
   User,
   Waves,
 } from 'lucide-react';
@@ -71,11 +69,11 @@ export function LoginPage({ onAuthenticated }: LoginPageProps) {
   return (
     <main className="min-h-screen bg-[#F4F6F8] grid grid-cols-1 lg:grid-cols-12">
       {/* Left Operational Brand Surface (LRT-2 Purple) */}
-      <section className="lg:col-span-5 bg-[#4C1D95] text-white p-8 sm:p-12 lg:p-14 flex flex-col justify-between gap-10">
+      <section className="lg:col-span-5 bg-[#4C1D95] text-white p-8 sm:p-12 lg:p-14 flex flex-col justify-center">
         <div>
           <div className="inline-flex items-center gap-2 bg-white text-[#4C1D95] px-3 py-1.5 rounded-md font-display font-bold text-sm tracking-tight">
             <Waves className="w-4 h-4" strokeWidth={2.2} />
-            AGOS-LRT2
+            LRT-2 Flood Monitor
           </div>
 
           <h1 className="mt-8 font-display text-3xl sm:text-4xl font-bold tracking-tight leading-tight text-white">
@@ -86,63 +84,18 @@ export function LoginPage({ onAuthenticated }: LoginPageProps) {
             hydrological simulation along the Metro Manila LRT Line 2 corridor.
           </p>
         </div>
-
-        <div className="space-y-3 border-t border-white/20 pt-6 text-xs sm:text-sm text-[#F5F3FF]">
-          <div className="flex items-center justify-between">
-            <span className="inline-flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#4ADE80]" />
-              GREEN · Normal Clearance
-            </span>
-            <span className="font-mono-num text-[#E9D5FF]">&gt; 50 cm</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="inline-flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#FB923C]" />
-              ORANGE · Pre-Flood Warning
-            </span>
-            <span className="font-mono-num text-[#E9D5FF]">26–50 cm</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="inline-flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#F87171]" />
-              RED · Critical Flood Alert
-            </span>
-            <span className="font-mono-num text-[#E9D5FF]">&le; 25 cm</span>
-          </div>
-        </div>
       </section>
 
       {/* Right Authenticator Surface (Flat, Unnested) */}
       <section className="lg:col-span-7 bg-white flex items-center justify-center p-8 sm:p-12 lg:p-16">
         <div className="w-full max-w-md">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="font-display text-2xl font-bold text-[#0F172A]">
-                {mode === 'signin' ? 'Operator Sign In' : 'Register Operator'}
-              </h2>
-              <p className="text-sm text-[#475569] mt-1">
-                Sign in with Supabase to monitor Manila LRT-2 stations.
-              </p>
-            </div>
-            <span
-              className={`shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold ${
-                isSupabaseConfigured
-                  ? 'bg-[#DCFCE7] text-[#15803D]'
-                  : 'bg-[#F3E8FF] text-[#5B21B6]'
-              }`}
-            >
-              {isSupabaseConfigured ? (
-                <>
-                  <ShieldCheck className="w-3.5 h-3.5" />
-                  Supabase Live
-                </>
-              ) : (
-                <>
-                  <Radio className="w-3.5 h-3.5" />
-                  Preview Auth
-                </>
-              )}
-            </span>
+          <div>
+            <h2 className="font-display text-2xl font-bold text-[#0F172A]">
+              {mode === 'signin' ? 'Operator Sign In' : 'Register Operator'}
+            </h2>
+            <p className="text-sm text-[#475569] mt-1">
+              Sign in to monitor Manila LRT-2 flood stations.
+            </p>
           </div>
 
           {!isSupabaseConfigured && (

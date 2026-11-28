@@ -1,8 +1,7 @@
-import { Play, Pause, Radio, Ruler, SlidersHorizontal } from 'lucide-react';
+import { Radio, Ruler } from 'lucide-react';
 import type {
   AlertLevel,
   Lrt2Station,
-  SimulationPreset,
   ThresholdConfig,
 } from '../types/flood';
 
@@ -12,20 +11,9 @@ interface WaterSimulationPanelProps {
   alertLevel: AlertLevel;
   thresholds: ThresholdConfig;
   selectedStation: Lrt2Station;
-  preset: SimulationPreset;
-  isPlaying: boolean;
-  onTogglePlay: () => void;
-  onSelectPreset: (preset: SimulationPreset) => void;
-  onManualDistanceChange: (distanceCm: number) => void;
+  lastUpdated: string | null;
+  isLiveConnected: boolean;
 }
-
-const PRESET_OPTIONS: Array<{ id: SimulationPreset; label: string }> = [
-  { id: 'rise_fall_cycle', label: 'Rise & Fall' },
-  { id: 'normal_cycle', label: 'Normal Flow' },
-  { id: 'rising_storm', label: 'Storm Rise' },
-  { id: 'critical_flood', label: 'Red Surge' },
-  { id: 'receding', label: 'Receding' },
-];
 
 export function WaterSimulationPanel({
   rawDistanceCm,
@@ -33,17 +21,14 @@ export function WaterSimulationPanel({
   alertLevel,
   thresholds,
   selectedStation,
-  preset,
-  isPlaying,
-  onTogglePlay,
-  onSelectPreset,
-  onManualDistanceChange,
+  lastUpdated,
+  isLiveConnected,
 }: WaterSimulationPanelProps) {
   const maxHeight = thresholds.mountHeightCm;
   const waterPct = Math.max(2, Math.min(96, (waterDepthCm / maxHeight) * 100));
 
-  const orangeDepthCm = Math.max(0, maxHeight - thresholds.warningDistanceCm);
-  const redDepthCm = Math.max(0, maxHeight - thresholds.alertDistanceCm);
+  const orangeDepthCm = thresholds.warningDistanceCm;
+  const redDepthCm = thresholds.alertDistanceCm;
   const orangePct = Math.max(4, Math.min(96, (orangeDepthCm / maxHeight) * 100));
   const redPct = Math.max(4, Math.min(96, (redDepthCm / maxHeight) * 100));
 
@@ -91,40 +76,37 @@ export function WaterSimulationPanel({
           };
 
   return (
-    <article className="bg-white rounded-[10px] border border-[#E2E8F0] p-4 flex flex-col justify-between">
+    <article className="bg-white rounded-[10px] border border-[#E2E8F0] p-4 flex flex-col justify-between h-full">
       {/* Header */}
       <div className="flex items-center justify-between gap-2 pb-3 border-b border-[#E2E8F0]">
         <div>
           <h2 className="font-display text-sm font-bold text-[#0F172A] flex items-center gap-2">
             <Ruler className="w-4 h-4 text-[#6B21A8]" />
-            Water Level Staff Gauge Simulation
+            Real-Time Water Level Staff Gauge
           </h2>
           <p className="text-xs text-[#64748B] mt-0.5">
             {selectedStation.name} · {selectedStation.waterway}
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={onTogglePlay}
-          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-[#CBD5E1] bg-[#F8FAFC] hover:bg-[#F1F5F9] text-xs font-semibold text-[#0F172A] cursor-pointer"
+        <span
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-bold border ${
+            isLiveConnected
+              ? 'bg-[#DCFCE7] text-[#15803D] border-[#86EFAC]'
+              : 'bg-[#F1F5F9] text-[#475569] border-[#CBD5E1]'
+          }`}
         >
-          {isPlaying ? (
-            <>
-              <Pause className="w-3.5 h-3.5" />
-              Pause
-            </>
-          ) : (
-            <>
-              <Play className="w-3.5 h-3.5" />
-              Play
-            </>
-          )}
-        </button>
+          <span
+            className={`w-2 h-2 rounded-full ${
+              isLiveConnected ? 'bg-[#16A34A]' : 'bg-[#94A3B8]'
+            }`}
+          />
+          {isLiveConnected ? 'LIVE ESP32' : 'WAITING'}
+        </span>
       </div>
 
-      {/* Staff-Gauge Ruler + Animated Water Column */}
-      <div className="mt-3 h-72 rounded-lg border border-[#CBD5E1] bg-[#F8FAFC] flex overflow-hidden select-none relative">
+      {/* Staff-Gauge Ruler + Animated Real-Time Water Column */}
+      <div className="mt-3 flex-1 min-h-[300px] rounded-lg border border-[#CBD5E1] bg-[#F8FAFC] flex overflow-hidden select-none relative">
         {/* Left Vertical Flood Staff-Gauge Ruler */}
         <div className="w-24 shrink-0 bg-[#FFFDF7] border-r-2 border-[#334155] relative z-30">
           {/* Colored Green / Orange / Red vertical band along the right edge of the ruler */}
@@ -197,7 +179,6 @@ export function WaterSimulationPanel({
 
         {/* Right Animated Water Tank & Ultrasonic Sensor */}
         <div className="flex-1 relative bg-[#F8FAFC] overflow-hidden">
-          {/* Subtle Horizontal Grid Lines aligned to major ruler marks */}
           {ticks
             .filter((t) => t.kind === 'major')
             .map((t) => (
@@ -217,7 +198,7 @@ export function WaterSimulationPanel({
             <div className="w-10 h-2 bg-[#334155] rounded-b-sm" />
           </div>
 
-          {/* Animated Sonar Pulse Waves dropping from Sensor to Water Surface */}
+          {/* Animated Sonar Pulse Waves */}
           <div
             className="absolute left-1/2 -translate-x-1/2 top-9 z-10 w-24 pointer-events-none transition-all duration-700 ease-out overflow-hidden"
             style={{ height: `calc(${100 - waterPct}% - 36px)` }}
@@ -226,7 +207,7 @@ export function WaterSimulationPanel({
               className="mx-auto w-0.5 h-full border-l-2 border-dashed opacity-75"
               style={{ borderColor: palette.beam }}
             />
-            {isPlaying && (
+            {isLiveConnected && (
               <>
                 <span
                   className="absolute top-0 left-1/2 -translate-x-1/2 w-12 h-3 rounded-full border-2 opacity-70"
@@ -274,7 +255,6 @@ export function WaterSimulationPanel({
               background: `linear-gradient(180deg, ${palette.waterTop}D9 0%, ${palette.waterMid}EE 45%, ${palette.waterDeep}F5 100%)`,
             }}
           >
-            {/* Primary & Secondary Wave Crests */}
             <div className="absolute -top-3 inset-x-0 h-4 overflow-hidden pointer-events-none">
               <svg
                 viewBox="0 0 400 24"
@@ -302,7 +282,6 @@ export function WaterSimulationPanel({
               </svg>
             </div>
 
-            {/* Water Surface Level Readout */}
             <div className="absolute bottom-2 inset-x-3 flex items-center justify-between text-white text-xs font-semibold drop-shadow-2xs">
               <span className="font-mono-num">
                 Water Depth: {waterDepthCm.toFixed(1)} cm
@@ -315,59 +294,14 @@ export function WaterSimulationPanel({
         </div>
       </div>
 
-      {/* Active Status Strip */}
+      {/* Active Real-Time Status Strip */}
       <div
         className={`mt-3 px-3 py-2 rounded-lg border text-xs font-semibold flex items-center justify-between ${palette.pill}`}
       >
         <span>{palette.statusText}</span>
-        <span className="font-mono-num">{alertLevel}</span>
-      </div>
-
-      {/* Interactive Slider + Scenario Buttons */}
-      <div className="mt-3 space-y-2.5">
-        <div>
-          <div className="flex items-center justify-between text-xs text-[#475569] mb-1">
-            <span className="inline-flex items-center gap-1.5 font-medium">
-              <SlidersHorizontal className="w-3.5 h-3.5" />
-              Adjust Water Level (Raw Distance)
-            </span>
-            <span className="font-mono-num font-bold text-[#0F172A]">
-              {rawDistanceCm.toFixed(1)} cm gap · {waterDepthCm.toFixed(1)} cm depth
-            </span>
-          </div>
-          <input
-            type="range"
-            min={5}
-            max={maxHeight - 5}
-            step={0.5}
-            value={rawDistanceCm}
-            onChange={(e) => onManualDistanceChange(Number(e.target.value))}
-            aria-label="Simulate raw ultrasonic sensor distance in centimeters"
-            className="w-full accent-[#6B21A8] cursor-pointer"
-          />
-          <div className="flex justify-between text-[11px] font-mono-num text-[#475569]">
-            <span>5 cm gap (High Flood)</span>
-            <span>{Math.round(maxHeight / 2)} cm</span>
-            <span>{maxHeight - 5} cm gap (Low Water)</span>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 pt-1">
-          {PRESET_OPTIONS.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              onClick={() => onSelectPreset(opt.id)}
-              className={`px-2 py-1.5 rounded-md text-[11px] font-semibold border transition-colors cursor-pointer ${
-                preset === opt.id
-                  ? 'bg-[#6B21A8] text-white border-[#6B21A8]'
-                  : 'bg-[#F8FAFC] text-[#334155] border-[#CBD5E1] hover:bg-[#F1F5F9]'
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
+        <span className="font-mono-num">
+          {lastUpdated ? `Updated ${lastUpdated}` : 'Waiting for ESP32...'}
+        </span>
       </div>
     </article>
   );

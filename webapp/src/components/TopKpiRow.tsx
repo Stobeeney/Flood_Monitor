@@ -191,21 +191,21 @@ export function TopKpiRow({
             {
               key: 'GREEN' as AlertLevel,
               title: 'Green · Normal',
-              range: `> ${thresholds.warningDistanceCm} cm`,
+              range: `0–${thresholds.warningDistanceCm - 1} cm`,
               dot: 'bg-[#16A34A]',
               active: 'bg-[#DCFCE7] text-[#14532D] rounded-md',
             },
             {
               key: 'ORANGE' as AlertLevel,
               title: 'Orange · Warning',
-              range: `${thresholds.alertDistanceCm + 1}–${thresholds.warningDistanceCm} cm`,
+              range: `${thresholds.warningDistanceCm}–${thresholds.alertDistanceCm - 1} cm`,
               dot: 'bg-[#EA580C]',
               active: 'bg-[#FFEDD5] text-[#7C2D12] rounded-md',
             },
             {
               key: 'RED' as AlertLevel,
               title: 'Red · Critical',
-              range: `≤ ${thresholds.alertDistanceCm} cm`,
+              range: `≥ ${thresholds.alertDistanceCm} cm`,
               dot: 'bg-[#DC2626]',
               active: 'bg-[#FEE2E2] text-[#7F1D1D] rounded-md',
             },
@@ -276,9 +276,9 @@ export function TopKpiRow({
         <div className="flex items-center justify-between text-[11px] text-[#475569]">
           <span className="inline-flex items-center gap-1 font-medium text-[#15803D]">
             <Activity className="w-3.5 h-3.5" />
-            Simulator Active
+            Live ESP32 Feed
           </span>
-          <span className="font-mono-num">1 Hz tick</span>
+          <span className="font-mono-num">Supabase RT</span>
         </div>
       </article>
 

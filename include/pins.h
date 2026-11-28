@@ -22,6 +22,10 @@ constexpr uint8_t kI2cScl = 22;
 // Active piezo buzzer (driven directly without MOSFET; use 100-220 ohm series resistor)
 constexpr uint8_t kPiezo = 23;
 
+// Status LEDs (connect each via 220-330 ohm series resistor to GND)
+constexpr uint8_t kLedGreen = 18;  // Normal (0-14 cm)
+constexpr uint8_t kLedRed = 19;    // Warning (blink) / Critical Alert (solid)
+
 // Air780E 4G LTE/GSM module (UART2)
 constexpr uint8_t kGsmRx = 16;    // Connect to Air780E TXD
 constexpr uint8_t kGsmTx = 17;    // Connect to Air780E RXD

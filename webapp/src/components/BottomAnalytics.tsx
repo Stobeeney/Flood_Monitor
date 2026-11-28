@@ -1,6 +1,15 @@
-import { CloudRain, Clock, Thermometer, TrendingUp } from 'lucide-react';
+import { useState } from 'react';
+import {
+  CloudRain,
+  Database,
+  Download,
+  Save,
+  Thermometer,
+  TrendingUp,
+} from 'lucide-react';
+import type { LiveReadingRow } from '../lib/supabase';
 import type {
-  AlertEvent,
+  AlertLevel,
   Lrt2Station,
   PhWeatherData,
   TelemetrySample,
@@ -9,19 +18,24 @@ import type {
 
 interface BottomAnalyticsProps {
   samples: TelemetrySample[];
-  alertEvents: AlertEvent[];
+  savedLogs: LiveReadingRow[];
   weatherData: PhWeatherData | null;
   selectedStation: Lrt2Station;
   thresholds: ThresholdConfig;
+  onSaveSnapshot: () => Promise<void>;
 }
 
 export function BottomAnalytics({
   samples,
-  alertEvents,
+  savedLogs,
   weatherData,
   selectedStation,
   thresholds,
+  onSaveSnapshot,
 }: BottomAnalyticsProps) {
+  const [filterLevel, setFilterLevel] = useState<'ALL' | AlertLevel>('ALL');
+  const [saving, setSaving] = useState(false);
+
   const totalSamples = Math.max(1, samples.length);
   const greenCount = samples.filter((s) => s.level === 'GREEN').length;
   const orangeCount = samples.filter((s) => s.level === 'ORANGE').length;
@@ -31,7 +45,6 @@ export function BottomAnalytics({
   const orangePct = Math.round((orangeCount / totalSamples) * 100);
   const redPct = Math.round((redCount / totalSamples) * 100);
 
-  // Build SVG trend curve for raw distance & water depth
   const trendSamples = samples.slice(-45);
   const chartPath = (() => {
     if (trendSamples.length < 2) return '';
@@ -50,18 +63,49 @@ export function BottomAnalytics({
     ...(weatherData?.hourly.map((h) => h.precipitationMm) ?? [2]),
   );
 
+  const visibleLogs =
+    filterLevel === 'ALL'
+      ? savedLogs
+      : savedLogs.filter((row) => row.alert_level === filterLevel);
+
+  function handleExportCsv() {
+    const header = 'id,recorded_at_ph,station_id,raw_distance_cm,water_depth_cm,alert_level,source';
+    const lines = visibleLogs.map((r) => {
+      const phTime = new Date(r.recorded_at).toLocaleString('en-PH', {
+        hour12: false,
+      });
+      return `${r.id},"${phTime}",${r.station_id},${Number(r.raw_distance_cm).toFixed(1)},${Number(r.water_depth_cm).toFixed(1)},${r.alert_level},${r.source}`;
+    });
+    const csv = [header, ...lines].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `lrt2_flood_logs_${selectedStation.id}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleSaveClick() {
+    setSaving(true);
+    try {
+      await onSaveSnapshot();
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <section className="space-y-4">
       {/* Row 1: Alert Zone Distribution + Manila Rainfall/Weather Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left: Green / Orange / Red Exposure Gauges */}
         <article className="lg:col-span-5 bg-white rounded-[10px] border border-[#E2E8F0] p-4">
           <div className="flex items-center justify-between pb-3 border-b border-[#E2E8F0]">
             <h2 className="font-display text-sm font-bold text-[#0F172A]">
               Monitoring Tier Distribution
             </h2>
             <span className="text-xs text-[#64748B] font-mono-num">
-              Last {samples.length} ticks
+              Last {samples.length} readings
             </span>
           </div>
 
@@ -132,7 +176,6 @@ export function BottomAnalytics({
           </div>
         </article>
 
-        {/* Right: Manila Open-Meteo Weather & Rainfall Panel */}
         <article className="lg:col-span-7 bg-white rounded-[10px] border border-[#E2E8F0] p-4">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E2E8F0]">
             <div>
@@ -185,20 +228,19 @@ export function BottomAnalytics({
         </article>
       </div>
 
-      {/* Row 2: Live Water Depth Trend + Incident Alert Log */}
+      {/* Row 2: Live Water Depth Trend + Persisted Supabase Logs & CSV Export */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left: Trend Chart */}
-        <article className="lg:col-span-6 bg-white rounded-[10px] border border-[#E2E8F0] p-4">
+        <article className="lg:col-span-5 bg-white rounded-[10px] border border-[#E2E8F0] p-4">
           <div className="flex items-center justify-between pb-3 border-b border-[#E2E8F0]">
             <h2 className="font-display text-sm font-bold text-[#0F172A] flex items-center gap-2">
               <TrendingUp className="w-4 h-4 text-[#0284C7]" />
-              Simulated Water Depth Curve (cm)
+              Live Water Depth Curve (cm)
             </h2>
-            <span className="text-xs text-[#64748B]">Higher curve = deeper water</span>
+            <span className="text-xs text-[#64748B]">Higher = deeper water</span>
           </div>
 
           <div className="mt-3">
-            <svg viewBox="0 0 520 140" className="w-full h-36">
+            <svg viewBox="0 0 520 140" className="w-full h-40">
               <line x1="0" y1="128" x2="520" y2="128" stroke="#E2E8F0" />
               <line
                 x1="0"
@@ -250,53 +292,117 @@ export function BottomAnalytics({
           </div>
         </article>
 
-        {/* Right: Recent Alert Transitions */}
-        <article className="lg:col-span-6 bg-white rounded-[10px] border border-[#E2E8F0] p-4">
-          <div className="flex items-center justify-between pb-3 border-b border-[#E2E8F0]">
-            <h2 className="font-display text-sm font-bold text-[#0F172A] flex items-center gap-2">
-              <Clock className="w-4 h-4 text-[#475569]" />
-              Alert Transition Log
-            </h2>
-            <span className="text-xs text-[#64748B] font-mono-num">
-              {alertEvents.length} logged
-            </span>
+        {/* Persisted Supabase Sensor Logs */}
+        <article className="lg:col-span-7 bg-white rounded-[10px] border border-[#E2E8F0] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E2E8F0]">
+            <div>
+              <h2 className="font-display text-sm font-bold text-[#0F172A] flex items-center gap-2">
+                <Database className="w-4 h-4 text-[#6B21A8]" />
+                Saved Cloud Logs ({visibleLogs.length})
+              </h2>
+              <p className="text-xs text-[#64748B] mt-0.5">
+                Stored in Supabase · {selectedStation.name}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(['ALL', 'RED', 'ORANGE', 'GREEN'] as const).map((lvl) => (
+                <button
+                  key={lvl}
+                  type="button"
+                  onClick={() => setFilterLevel(lvl)}
+                  className={`px-2 py-1 rounded text-[11px] font-semibold border cursor-pointer ${
+                    filterLevel === lvl
+                      ? 'bg-[#6B21A8] text-white border-[#6B21A8]'
+                      : 'bg-[#F8FAFC] text-[#475569] border-[#CBD5E1] hover:bg-[#F1F5F9]'
+                  }`}
+                >
+                  {lvl}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={handleSaveClick}
+                disabled={saving}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#F3E8FF] text-[#4C1D95] border border-[#D8B4FE] text-[11px] font-semibold hover:bg-[#E9D5FF] disabled:opacity-60 cursor-pointer"
+              >
+                <Save className="w-3 h-3" />
+                {saving ? 'Saving...' : 'Save Now'}
+              </button>
+              <button
+                type="button"
+                onClick={handleExportCsv}
+                disabled={visibleLogs.length === 0}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#111827] text-white text-[11px] font-semibold hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+              >
+                <Download className="w-3 h-3" />
+                Export CSV
+              </button>
+            </div>
           </div>
 
-          <div className="mt-3 max-h-40 overflow-y-auto divide-y divide-[#F1F5F9]">
-            {alertEvents.length === 0 ? (
+          <div className="mt-2 max-h-48 overflow-y-auto">
+            {visibleLogs.length === 0 ? (
               <p className="text-xs text-[#64748B] py-6 text-center">
-                No warning transitions recorded yet. Trigger Storm Rise or drag the
-                simulation slider to observe Green/Orange/Red events.
+                No saved readings yet for {selectedStation.name}. Connect your ESP32
+                to Wi-Fi and Supabase to log live measurements here.
               </p>
             ) : (
-              alertEvents.slice(0, 8).map((ev) => {
-                const badge =
-                  ev.level === 'RED'
-                    ? 'bg-[#FEE2E2] text-[#B91C1C]'
-                    : ev.level === 'ORANGE'
-                      ? 'bg-[#FFEDD5] text-[#C2410C]'
-                      : 'bg-[#DCFCE7] text-[#15803D]';
-                return (
-                  <div
-                    key={ev.id}
-                    className="py-2 flex items-center justify-between gap-3 text-xs"
-                  >
-                    <div className="min-w-0">
-                      <p className="font-medium text-[#0F172A] truncate">
-                        {ev.stationName} · {ev.message}
-                      </p>
-                      <p className="text-[11px] font-mono-num text-[#64748B]">
-                        {ev.timestamp} · Raw {ev.rawDistanceCm.toFixed(1)} cm
-                      </p>
-                    </div>
-                    <span
-                      className={`shrink-0 px-2 py-0.5 rounded text-[11px] font-bold ${badge}`}
-                    >
-                      {ev.level}
-                    </span>
-                  </div>
-                );
-              })
+              <table className="w-full text-left text-xs">
+                <thead className="sticky top-0 bg-[#F8FAFC] text-[#475569] border-b border-[#E2E8F0]">
+                  <tr>
+                    <th className="py-1.5 px-2 font-semibold">Date &amp; Time (PH)</th>
+                    <th className="py-1.5 px-2 font-semibold">Raw Gap</th>
+                    <th className="py-1.5 px-2 font-semibold">Water Depth</th>
+                    <th className="py-1.5 px-2 font-semibold">Status</th>
+                    <th className="py-1.5 px-2 font-semibold">Source</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#F1F5F9]">
+                  {visibleLogs.slice(0, 50).map((row) => {
+                    const badge =
+                      row.alert_level === 'RED'
+                        ? 'bg-[#FEE2E2] text-[#B91C1C]'
+                        : row.alert_level === 'ORANGE'
+                          ? 'bg-[#FFEDD5] text-[#C2410C]'
+                          : 'bg-[#DCFCE7] text-[#15803D]';
+                    const phDateTime = new Date(row.recorded_at).toLocaleString(
+                      'en-PH',
+                      {
+                        month: 'short',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                      },
+                    );
+                    return (
+                      <tr key={row.id} className="hover:bg-[#F8FAFC]">
+                        <td className="py-1.5 px-2 font-mono-num text-[#334155]">
+                          {phDateTime}
+                        </td>
+                        <td className="py-1.5 px-2 font-mono-num font-semibold text-[#0F172A]">
+                          {Number(row.raw_distance_cm).toFixed(1)} cm
+                        </td>
+                        <td className="py-1.5 px-2 font-mono-num text-[#334155]">
+                          {Number(row.water_depth_cm).toFixed(1)} cm
+                        </td>
+                        <td className="py-1.5 px-2">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${badge}`}
+                          >
+                            {row.alert_level}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2 font-mono-num text-[#64748B]">
+                          {row.source}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             )}
           </div>
         </article>

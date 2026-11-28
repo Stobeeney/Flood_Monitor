@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -19,7 +20,11 @@ constexpr unsigned long kHcTimeoutUs = 25000UL;
 constexpr unsigned long kReadIntervalMs = 1000UL;
 constexpr unsigned long kGsmRetryIntervalMs = 15000UL;
 constexpr unsigned long kWifiRetryIntervalMs = 20000UL;
-constexpr unsigned long kCloudPushIntervalMs = 5000UL;
+constexpr unsigned long kWifiNoticeIntervalMs = 120000UL;  // 2 minutes
+constexpr unsigned long kCloudPushIntervalMs = 1500UL;
+constexpr unsigned long kLocalLogIntervalMs = 10000UL;
+constexpr size_t kMaxLocalLogBytes = 250000UL;
+constexpr const char* kLocalLogPath = "/logs.csv";
 constexpr long kPhGmtOffsetSec = 8 * 3600;  // Asia/Manila UTC+8
 
 constexpr float kJsnMinReliableCm = 25.0f;
@@ -43,10 +48,33 @@ String savedWifiPass;
 String savedSupabaseUrl;
 String savedSupabaseKey;
 String savedStationId = "santolan";
-float savedMountHeightCm = 180.0f;
+String savedSmsPhone;
+float savedMountHeightCm = 45.0f;
 
 bool ntpSynced = false;
+bool wifiWasConnected = false;
+bool wifiFailedNotice = false;
+bool cloudConnected = false;
+bool cloudFailedNotice = false;
 int lastCloudHttpCode = 0;
+bool fsReady = false;
+size_t localLogBytes = 0;
+unsigned long lastLocalLogMs = 0;
+
+String lcdNoticeLine0;
+String lcdNoticeLine1;
+unsigned long lcdNoticeUntilMs = 0;
+
+void showLcdNotice(const String& line0, const String& line1,
+                   unsigned long durationMs = 3000UL) {
+  lcdNoticeLine0 = line0;
+  lcdNoticeLine1 = line1;
+  lcdNoticeUntilMs = millis() + durationMs;
+  if (lcd.isConnected()) {
+    lcd.updateLine(0, lcdNoticeLine0);
+    lcd.updateLine(1, lcdNoticeLine1);
+  }
+}
 
 float jsnDistanceCm = -1.0f;
 float hcDistanceCm = -1.0f;
@@ -61,6 +89,8 @@ RtcDateTime currentRtc{};
 unsigned long lastReadMs = 0;
 unsigned long lastGsmProbeMs = 0;
 unsigned long lastWifiAttemptMs = 0;
+unsigned long lastWifiNoticeMs = 0;
+bool hasShownWifiFailNotice = false;
 unsigned long lastCloudPushMs = 0;
 unsigned long lastSmsMs = 0;
 bool hasSentSms = false;
@@ -127,9 +157,27 @@ void updatePiezo() {
   digitalWrite(pins::kPiezo, buzzerOn ? HIGH : LOW);
 }
 
+void updateStatusLeds() {
+  const unsigned long now = millis();
+  bool greenOn = false;
+  bool redOn = false;
+  if (validReading) {
+    if (floodLevel == FloodLevel::kFloodAlert) {
+      redOn = true;
+    } else if (floodLevel == FloodLevel::kWarning) {
+      redOn = (now % 1000UL) < 500UL;
+    } else {
+      greenOn = true;
+    }
+  }
+  digitalWrite(pins::kLedGreen, greenOn ? HIGH : LOW);
+  digitalWrite(pins::kLedRed, redOn ? HIGH : LOW);
+}
+
 void idleService() {
   server.handleClient();
   updatePiezo();
+  updateStatusLeds();
 }
 
 void serviceDelayMs(unsigned long durationMs) {
@@ -147,17 +195,54 @@ void loadSettings() {
   savedSupabaseUrl = prefs.getString("sb_url", "");
   savedSupabaseKey = prefs.getString("sb_key", "");
   savedStationId = prefs.getString("station", "santolan");
-  savedMountHeightCm = prefs.getFloat("mount_cm", 180.0f);
+  savedSmsPhone = prefs.getString("sms_phone", ALERT_PHONE_NUMBER);
+  savedMountHeightCm = prefs.getFloat("base_cm", 45.0f);
   prefs.end();
 }
 
-void startStaConnect() {
+void startStaConnect(bool showNotice = false) {
   if (savedWifiSsid.isEmpty()) {
     return;
   }
-  Serial.printf("Connecting to Wi-Fi STA: %s\n", savedWifiSsid.c_str());
+  Serial.printf("Connecting WiFi: %s\n", savedWifiSsid.c_str());
+  if (showNotice) {
+    showLcdNotice("Connecting WiFi", savedWifiSsid, 2500);
+    hasShownWifiFailNotice = false;
+  }
   WiFi.begin(savedWifiSsid.c_str(), savedWifiPass.c_str());
   lastWifiAttemptMs = millis();
+  wifiFailedNotice = false;
+}
+
+void setSystemClock(const RtcDateTime& dt) {
+  struct tm t{};
+  t.tm_year = dt.year - 1900;
+  t.tm_mon = dt.month - 1;
+  t.tm_mday = dt.day;
+  t.tm_hour = dt.hour;
+  t.tm_min = dt.minute;
+  t.tm_sec = dt.second;
+  t.tm_isdst = 0;
+  const time_t epoch = mktime(&t);
+  struct timeval tv{epoch, 0};
+  settimeofday(&tv, nullptr);
+}
+
+RtcDateTime readBestTime() {
+  const RtcDateTime hw = rtc.now();
+  if (hw.isValid()) {
+    return hw;
+  }
+  const time_t nowEpoch = time(nullptr);
+  struct tm t{};
+  localtime_r(&nowEpoch, &t);
+  RtcDateTime sw{static_cast<uint16_t>(t.tm_year + 1900),
+                 static_cast<uint8_t>(t.tm_mon + 1),
+                 static_cast<uint8_t>(t.tm_mday),
+                 static_cast<uint8_t>(t.tm_hour),
+                 static_cast<uint8_t>(t.tm_min),
+                 static_cast<uint8_t>(t.tm_sec)};
+  return sw;
 }
 
 bool syncTimeFromNtpToRtc() {
@@ -191,6 +276,57 @@ bool syncTimeFromNtpToRtc() {
 bool isCloudConfigured() {
   return savedSupabaseUrl.startsWith("https://") &&
          savedSupabaseKey.length() > 20;
+}
+
+void resetLocalLogFile() {
+  if (!fsReady) {
+    return;
+  }
+  File f = LittleFS.open(kLocalLogPath, FILE_WRITE);
+  if (f) {
+    f.println("timestamp,station_id,raw_distance_cm,water_depth_cm,alert_level,sensor,cloud_connected");
+    localLogBytes = f.size();
+    f.close();
+  }
+}
+
+void initLocalLogFs() {
+  fsReady = LittleFS.begin(true);
+  if (!fsReady) {
+    Serial.println("LittleFS mount failed; local flash logging disabled.");
+    return;
+  }
+  if (!LittleFS.exists(kLocalLogPath)) {
+    resetLocalLogFile();
+  } else {
+    File f = LittleFS.open(kLocalLogPath, FILE_READ);
+    if (f) {
+      localLogBytes = f.size();
+      f.close();
+    }
+  }
+  Serial.printf("LittleFS ready: %s (%u bytes)\n", kLocalLogPath,
+                static_cast<unsigned>(localLogBytes));
+}
+
+void appendLocalLog() {
+  if (!fsReady || !validReading) {
+    return;
+  }
+  if (localLogBytes >= kMaxLocalLogBytes) {
+    resetLocalLogFile();
+  }
+  File f = LittleFS.open(kLocalLogPath, FILE_APPEND);
+  if (!f) {
+    return;
+  }
+  const float waterDepthCm = max(0.0f, savedMountHeightCm - fusedDistanceCm);
+  f.printf("%s,%s,%.1f,%.1f,%s,%s,%d\n", currentRtc.formatIso().c_str(),
+           savedStationId.c_str(), fusedDistanceCm, waterDepthCm,
+           supabaseAlertLevel(floodLevel), sensorLabel(activeSource),
+           cloudConnected ? 1 : 0);
+  localLogBytes = f.size();
+  f.close();
 }
 
 void pushReadingToSupabase() {
@@ -228,8 +364,34 @@ void pushReadingToSupabase() {
     http.addHeader("Prefer", "return=minimal");
     lastCloudHttpCode = http.POST(payload);
     http.end();
+    const bool ok = (lastCloudHttpCode >= 200 && lastCloudHttpCode < 300);
+    if (ok) {
+      if (!cloudConnected) {
+        cloudConnected = true;
+        cloudFailedNotice = false;
+        Serial.printf("Connected to the cloud! (Supabase HTTP %d)\n",
+                      lastCloudHttpCode);
+        showLcdNotice("Connected to", "the cloud!", 3000);
+      }
+    } else {
+      cloudConnected = false;
+      if (!cloudFailedNotice) {
+        cloudFailedNotice = true;
+        Serial.printf("Could not connect to the cloud (HTTP %d)\n",
+                      lastCloudHttpCode);
+        showLcdNotice("Could not", "connect cloud!", 3000);
+      }
+    }
     Serial.printf("Supabase POST -> HTTP %d (%s)\n", lastCloudHttpCode,
                   payload.c_str());
+  } else {
+    cloudConnected = false;
+    lastCloudHttpCode = -1;
+    if (!cloudFailedNotice) {
+      cloudFailedNotice = true;
+      Serial.println("Could not connect to the cloud (HTTP begin failed)");
+      showLcdNotice("Could not", "connect cloud!", 3000);
+    }
   }
 }
 
@@ -275,19 +437,23 @@ void fuseReadings(float jsnCm, float hcCm) {
   validReading = false;
 }
 
-FloodLevel evaluateTargetLevel(float distanceCm, FloodLevel current) {
-  if (distanceCm <= ALERT_DISTANCE_CM) {
+float currentWaterDepthCm() {
+  return max(0.0f, savedMountHeightCm - fusedDistanceCm);
+}
+
+FloodLevel evaluateTargetLevel(float waterDepthCm, FloodLevel current) {
+  if (waterDepthCm >= ALERT_DEPTH_CM) {
     return FloodLevel::kFloodAlert;
   }
   if (current == FloodLevel::kFloodAlert &&
-      distanceCm < ALERT_DISTANCE_CM + CLEAR_HYSTERESIS_CM) {
+      waterDepthCm > ALERT_DEPTH_CM - CLEAR_HYSTERESIS_CM) {
     return FloodLevel::kFloodAlert;
   }
-  if (distanceCm <= WARNING_DISTANCE_CM) {
+  if (waterDepthCm >= WARNING_DEPTH_CM) {
     return FloodLevel::kWarning;
   }
   if (current == FloodLevel::kWarning &&
-      distanceCm < WARNING_DISTANCE_CM + CLEAR_HYSTERESIS_CM) {
+      waterDepthCm > WARNING_DEPTH_CM - CLEAR_HYSTERESIS_CM) {
     return FloodLevel::kWarning;
   }
   return FloodLevel::kNormal;
@@ -302,7 +468,7 @@ void maybeSendAlertSms(FloodLevel previous, FloodLevel next) {
   if (!isEscalation && !isRecovery) {
     return;
   }
-  if (!Air780eGsm::isPhoneConfigured(ALERT_PHONE_NUMBER)) {
+  if (!Air780eGsm::isPhoneConfigured(savedSmsPhone.c_str())) {
     return;
   }
 
@@ -316,14 +482,16 @@ void maybeSendAlertSms(FloodLevel previous, FloodLevel next) {
   msg += levelLabel(next, true);
   msg += "] ";
   msg += currentRtc.formatIso();
-  msg += " | Dist: ";
+  msg += " | Level: ";
+  msg += String(currentWaterDepthCm(), 1);
+  msg += " cm (Dist: ";
   msg += String(fusedDistanceCm, 1);
-  msg += " cm (";
+  msg += " cm, ";
   msg += sensorLabel(activeSource);
   msg += ")";
 
-  Serial.printf("Sending SMS to %s: %s\n", ALERT_PHONE_NUMBER, msg.c_str());
-  if (gsm.sendSms(ALERT_PHONE_NUMBER, msg)) {
+  Serial.printf("Sending SMS to %s: %s\n", savedSmsPhone.c_str(), msg.c_str());
+  if (gsm.sendSms(savedSmsPhone.c_str(), msg)) {
     lastSmsMs = millis();
     hasSentSms = true;
     Serial.println("SMS sent successfully.");
@@ -336,7 +504,8 @@ void updateFloodState() {
   if (!validReading) {
     return;
   }
-  const FloodLevel target = evaluateTargetLevel(fusedDistanceCm, floodLevel);
+  const FloodLevel target =
+      evaluateTargetLevel(currentWaterDepthCm(), floodLevel);
   if (target == floodLevel) {
     pendingLevel = floodLevel;
     pendingCount = 0;
@@ -356,7 +525,9 @@ void updateFloodState() {
     pendingCount = 0;
     maybeSendAlertSms(previous, floodLevel);
     pushReadingToSupabase();
+    appendLocalLog();
     lastCloudPushMs = millis();
+    lastLocalLogMs = millis();
   }
 }
 
@@ -364,11 +535,16 @@ void updateLcdDisplay() {
   if (!lcd.isConnected()) {
     return;
   }
+  if (millis() < lcdNoticeUntilMs) {
+    lcd.updateLine(0, lcdNoticeLine0);
+    lcd.updateLine(1, lcdNoticeLine1);
+    return;
+  }
   char line0[17];
   if (validReading) {
-    snprintf(line0, sizeof(line0), "Dist: %5.1f cm  ", fusedDistanceCm);
+    snprintf(line0, sizeof(line0), "Lvl:  %5.1f cm  ", currentWaterDepthCm());
   } else {
-    snprintf(line0, sizeof(line0), "Dist:  --.- cm  ");
+    snprintf(line0, sizeof(line0), "Lvl:   --.- cm  ");
   }
 
   char line1[17];
@@ -379,6 +555,8 @@ void updateLcdDisplay() {
   lcd.updateLine(0, line0);
   lcd.updateLine(1, line1);
 }
+
+String normalizePhPhone(String raw);
 
 void handleSerialCommands() {
   while (Serial.available()) {
@@ -413,6 +591,27 @@ void handleSerialCommands() {
       } else {
         Serial.println("Usage: SET_TIME YYYY-MM-DD HH:MM:SS");
       }
+    } else if (serialCmdBuffer.startsWith("TEST_SMS ")) {
+      const String phone = normalizePhPhone(serialCmdBuffer.substring(9));
+      if (!Air780eGsm::isPhoneConfigured(phone.c_str())) {
+        Serial.println("TEST_SMS: Invalid phone number.");
+      } else {
+        savedSmsPhone = phone;
+        prefs.begin("floodcfg", false);
+        prefs.putString("sms_phone", savedSmsPhone);
+        prefs.end();
+        String msg = "LRT2 FLOOD MONITOR TEST | ";
+        msg += currentRtc.formatIso();
+        msg += " | Dist: ";
+        msg += validReading ? (String(fusedDistanceCm, 1) + " cm") : String("NO_ECHO");
+        msg += " | Smart SIM OK";
+        Serial.printf("TEST_SMS sending to %s...\n", savedSmsPhone.c_str());
+        if (gsm.sendSms(savedSmsPhone.c_str(), msg)) {
+          Serial.println("TEST_SMS_OK");
+        } else {
+          Serial.println("TEST_SMS_FAILED");
+        }
+      }
     }
     serialCmdBuffer = "";
   }
@@ -435,6 +634,8 @@ void sendStatus() {
   const bool staConnected = WiFi.status() == WL_CONNECTED;
   String json = "{\"distance_cm\":";
   json += validReading ? String(fusedDistanceCm, 1) : String("null");
+  json += ",\"water_depth_cm\":";
+  json += validReading ? String(currentWaterDepthCm(), 1) : String("null");
   json += ",\"jsn_cm\":";
   json += (jsnDistanceCm > 0) ? String(jsnDistanceCm, 1) : String("null");
   json += ",\"hc_cm\":";
@@ -449,6 +650,8 @@ void sendStatus() {
   json += gsm.isReady() ? "true" : "false";
   json += ",\"wifi_connected\":";
   json += staConnected ? "true" : "false";
+  json += ",\"wifi_failed\":";
+  json += wifiFailedNotice ? "true" : "false";
   json += ",\"wifi_ssid\":\"";
   json += escapeJson(savedWifiSsid);
   json += "\",\"sta_ip\":\"";
@@ -457,14 +660,20 @@ void sendStatus() {
   json += ntpSynced ? "true" : "false";
   json += ",\"cloud_configured\":";
   json += isCloudConfigured() ? "true" : "false";
+  json += ",\"cloud_connected\":";
+  json += cloudConnected ? "true" : "false";
   json += ",\"cloud_last_code\":";
   json += String(lastCloudHttpCode);
   json += ",\"sb_url\":\"";
   json += escapeJson(savedSupabaseUrl);
   json += "\",\"station_id\":\"";
   json += escapeJson(savedStationId);
+  json += "\",\"sms_phone\":\"";
+  json += escapeJson(savedSmsPhone);
   json += "\",\"mount_cm\":";
   json += String(savedMountHeightCm, 0);
+  json += ",\"log_bytes\":";
+  json += String(localLogBytes);
   json += ",\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"}";
 
   server.sendHeader("Cache-Control", "no-store");
@@ -506,7 +715,7 @@ void handleWifiSave() {
   ntpSynced = false;
   WiFi.disconnect(false);
   delay(100);
-  startStaConnect();
+  startStaConnect(true);
   server.send(200, "text/plain",
               "Saved! Connecting to " + savedWifiSsid +
                   " (NTP time will sync automatically once connected).");
@@ -545,9 +754,9 @@ void handleCloudSave() {
     prefs.putString("station", savedStationId);
   }
   const float parsedMount = mountStr.toFloat();
-  if (parsedMount >= 50.0f && parsedMount <= 450.0f) {
+  if (parsedMount >= 30.0f && parsedMount <= 450.0f) {
     savedMountHeightCm = parsedMount;
-    prefs.putFloat("mount_cm", savedMountHeightCm);
+    prefs.putFloat("base_cm", savedMountHeightCm);
   }
   prefs.end();
 
@@ -555,6 +764,128 @@ void handleCloudSave() {
   server.send(200, "text/plain",
               "Cloud settings saved! ESP32 will push live data for station '" +
                   savedStationId + "' to Supabase.");
+}
+
+void handleDownloadLogs() {
+  if (!fsReady || !LittleFS.exists(kLocalLogPath)) {
+    server.send(404, "text/plain", "No local logs stored yet.");
+    return;
+  }
+  File f = LittleFS.open(kLocalLogPath, FILE_READ);
+  if (!f) {
+    server.send(500, "text/plain", "Could not open logs.csv.");
+    return;
+  }
+  server.sendHeader("Content-Disposition",
+                    "attachment; filename=\"esp32_flood_logs.csv\"");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleClearLogs() {
+  if (!fsReady) {
+    fsReady = LittleFS.begin(true);
+  }
+  if (!fsReady) {
+    server.send(500, "text/plain", "Flash storage not ready.");
+    return;
+  }
+  LittleFS.remove(kLocalLogPath);
+  resetLocalLogFile();
+  server.send(200, "text/plain", "Local flash logs cleared.");
+}
+
+String normalizePhPhone(String raw) {
+  raw.trim();
+  raw.replace(" ", "");
+  raw.replace("-", "");
+  if (raw.startsWith("09") && raw.length() == 11) {
+    return "+63" + raw.substring(1);
+  }
+  if (raw.startsWith("639") && raw.length() == 12) {
+    return "+" + raw;
+  }
+  return raw;
+}
+
+void handleSmsSave() {
+  const String phone = normalizePhPhone(server.arg("phone"));
+  if (!Air780eGsm::isPhoneConfigured(phone.c_str())) {
+    server.send(400, "text/plain",
+                "Enter a valid PH mobile number (e.g. 09171234567 or +639171234567).");
+    return;
+  }
+  savedSmsPhone = phone;
+  prefs.begin("floodcfg", false);
+  prefs.putString("sms_phone", savedSmsPhone);
+  prefs.end();
+  server.send(200, "text/plain", "SMS recipient saved: " + savedSmsPhone);
+}
+
+void handleSmsTest() {
+  if (!Air780eGsm::isPhoneConfigured(savedSmsPhone.c_str())) {
+    server.send(400, "text/plain", "Save a valid recipient phone number first.");
+    return;
+  }
+  String msg = "LRT2 FLOOD MONITOR TEST | ";
+  msg += currentRtc.formatIso();
+  msg += " | Dist: ";
+  msg += validReading ? (String(fusedDistanceCm, 1) + " cm") : String("NO_ECHO");
+  msg += " | Smart SIM OK";
+  if (gsm.sendSms(savedSmsPhone.c_str(), msg)) {
+    server.send(200, "text/plain", "Test SMS sent to " + savedSmsPhone + "!");
+  } else {
+    server.send(500, "text/plain",
+                "Failed to send SMS. Check Smart SIM load, signal, and Air780E 5V power.");
+  }
+}
+
+void handleSetTime() {
+  String raw = server.arg("datetime");
+  raw.trim();
+  raw.replace("T", " ");
+  int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+  const int parsed = sscanf(raw.c_str(), "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s);
+  if (parsed < 5) {
+    server.send(400, "text/plain", "Invalid date/time format. Use YYYY-MM-DD HH:MM:SS.");
+    return;
+  }
+  RtcDateTime dt{static_cast<uint16_t>(y), static_cast<uint8_t>(mo),
+                 static_cast<uint8_t>(d),  static_cast<uint8_t>(h),
+                 static_cast<uint8_t>(mi), static_cast<uint8_t>(parsed >= 6 ? s : 0)};
+  if (!dt.isValid()) {
+    server.send(400, "text/plain", "Date/time out of valid range (year 2024-2099).");
+    return;
+  }
+  rtc.setDateTime(dt);
+  setSystemClock(dt);
+  currentRtc = dt;
+  ntpSynced = true;
+  showLcdNotice("Time Updated!", currentRtc.formatShortTime(), 2500);
+  updateLcdDisplay();
+  Serial.printf("Manual RTC time set via web: %s\n", currentRtc.formatIso().c_str());
+  server.send(200, "text/plain", "RTC & LCD updated: " + currentRtc.formatIso());
+}
+
+void handleCalibrateBaseline() {
+  if (!validReading || fusedDistanceCm < 30.0f || fusedDistanceCm > 450.0f) {
+    server.send(400, "text/plain",
+                "Cannot calibrate: sensor distance must be between 30 and 450 cm.");
+    return;
+  }
+  savedMountHeightCm = fusedDistanceCm;
+  prefs.begin("floodcfg", false);
+  prefs.putFloat("base_cm", savedMountHeightCm);
+  prefs.end();
+  floodLevel = FloodLevel::kNormal;
+  pendingLevel = FloodLevel::kNormal;
+  pendingCount = 0;
+  showLcdNotice("Baseline Set!", String(savedMountHeightCm, 1) + " cm = 0cm", 2500);
+  updateLcdDisplay();
+  updatePiezo();
+  updateStatusLeds();
+  server.send(200, "text/plain",
+              "Baseline calibrated: " + String(savedMountHeightCm, 1) + " cm = 0.0 cm (NORMAL)");
 }
 }  // namespace
 
@@ -572,10 +903,20 @@ void setup() {
   pinMode(pins::kPiezo, OUTPUT);
   digitalWrite(pins::kPiezo, LOW);
 
+  pinMode(pins::kLedGreen, OUTPUT);
+  digitalWrite(pins::kLedGreen, LOW);
+  pinMode(pins::kLedRed, OUTPUT);
+  digitalWrite(pins::kLedRed, LOW);
+
   loadSettings();
+  initLocalLogFs();
 
   rtc.begin();
   currentRtc = rtc.now();
+  if (!currentRtc.isValid()) {
+    currentRtc = Ds1302Rtc::compileDateTime();
+  }
+  setSystemClock(currentRtc);
 
   if (lcd.begin(pins::kI2cSda, pins::kI2cScl, LCD_I2C_ADDR)) {
     Serial.printf("LCD 16x2 detected at I2C 0x%02X\n", lcd.address());
@@ -611,6 +952,12 @@ void setup() {
   server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
   server.on("/api/ntp/sync", HTTP_POST, handleNtpSync);
   server.on("/api/cloud/save", HTTP_POST, handleCloudSave);
+  server.on("/logs.csv", HTTP_GET, handleDownloadLogs);
+  server.on("/api/logs/clear", HTTP_POST, handleClearLogs);
+  server.on("/api/sms/save", HTTP_POST, handleSmsSave);
+  server.on("/api/sms/test", HTTP_POST, handleSmsTest);
+  server.on("/api/time/set", HTTP_POST, handleSetTime);
+  server.on("/api/baseline/calibrate", HTTP_POST, handleCalibrateBaseline);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
 
@@ -628,11 +975,35 @@ void loop() {
   // Maintain Wi-Fi STA connection & auto-sync NTP -> DS1302 RTC once connected
   if (!savedWifiSsid.isEmpty()) {
     if (WiFi.status() == WL_CONNECTED) {
+      if (!wifiWasConnected) {
+        wifiWasConnected = true;
+        wifiFailedNotice = false;
+        Serial.printf("Connected WiFi! SSID=%s IP=%s\n", savedWifiSsid.c_str(),
+                      WiFi.localIP().toString().c_str());
+        showLcdNotice("Connected WiFi!", WiFi.localIP().toString(), 3000);
+      }
       if (!ntpSynced) {
         syncTimeFromNtpToRtc();
       }
-    } else if (now - lastWifiAttemptMs >= kWifiRetryIntervalMs) {
-      startStaConnect();
+    } else {
+      if (wifiWasConnected) {
+        wifiWasConnected = false;
+        cloudConnected = false;
+        Serial.println("WiFi disconnected.");
+      }
+      if (!wifiFailedNotice && (now - lastWifiAttemptMs >= 15000UL)) {
+        wifiFailedNotice = true;
+        Serial.printf("Could not connect WiFi (%s)\n", savedWifiSsid.c_str());
+        if (!hasShownWifiFailNotice ||
+            (now - lastWifiNoticeMs >= kWifiNoticeIntervalMs)) {
+          hasShownWifiFailNotice = true;
+          lastWifiNoticeMs = now;
+          showLcdNotice("Could not", "connect WiFi!", 3000);
+        }
+      }
+      if (now - lastWifiAttemptMs >= kWifiRetryIntervalMs) {
+        startStaConnect(false);
+      }
     }
   }
 
@@ -656,15 +1027,22 @@ void loop() {
       readUltrasonicCm(pins::kJsnTrig, pins::kJsnEcho, 20, kJsnTimeoutUs);
 
   fuseReadings(jsnDistanceCm, hcDistanceCm);
-  currentRtc = rtc.now();
+  currentRtc = readBestTime();
   updateFloodState();
   updateLcdDisplay();
   updatePiezo();
+  updateStatusLeds();
 
-  // Push live telemetry to Supabase every 5 seconds for the Vercel dashboard
+  // Push live telemetry to Supabase every 1.5s for the Vercel dashboard
   if (now - lastCloudPushMs >= kCloudPushIntervalMs) {
     lastCloudPushMs = now;
     pushReadingToSupabase();
+  }
+
+  // Save backup CSV log row to ESP32 internal flash (LittleFS) every 10s
+  if (now - lastLocalLogMs >= kLocalLogIntervalMs) {
+    lastLocalLogMs = now;
+    appendLocalLog();
   }
 
   if (validReading) {
